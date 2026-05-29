@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         蕴瑜课堂手动启动循环播放下一集
 // @namespace    http://tampermonkey.net/
-// @version      1.5
+// @version      1.6
 // @icon         https://courses.gdut.edu.cn/pluginfile.php/1/theme_lambda2/favicon/1776322049/favicon.ico
-// @description  手动启动后等待当前视频结束，自动切下一集，并在切集后自动播放；自动处理“按住通过”并保持前台状态
+// @description  手动启动后等待当前视频结束，自动切下一集并自动播放；切集后短播放/暂停/回退再播；自动处理“按住通过”并保持前台状态
 // @match        https://courses.gdut.edu.cn/*
 // @match        https://courses.gdut.edu.cn/mod/fsresource/view.php*
 // @match        https://jyresource.gdut.edu.cn/*
@@ -17,10 +17,11 @@
 2. 当前页启动后先默默待机，只监听 video/audio 或常见播放器的“播放结束”事件，不立刻自动播放当前页。
 3. 当前视频自然结束后，优先从 Moodle/蕴瑜课堂左侧课程索引寻找下一集并自动跳转。
 4. 脚本自动切到下一集后，才会对新页面做一次有限重试的自动播放。
-5. 下一集开始播放后继续待机，等待下一次自然结束，然后重复“切集 -> 自动播放 -> 待机”。
-6. 播放器监听不使用 setInterval 常驻扫描（按住通过检测除外）；播放器暂未出现时，只做几次短延迟重试。
-7. 不倍速、不伪造观看进度、不跳过视频。
-8. 自动处理“按住通过”课堂注意力校验，并尽量保持页面前台、焦点与可见性状态。
+5. 切集后播放成功会执行一次流程：随机播放约 5s -> 随机暂停约 5s -> 回到 00:00 -> 重新播放。
+6. 下一集开始播放后继续待机，等待下一次自然结束，然后重复“切集 -> 自动播放 -> 待机”。
+7. 播放器监听不使用 setInterval 常驻扫描（按住通过检测除外）；播放器暂未出现时，只做几次短延迟重试。
+8. 不倍速、不伪造观看进度、不跳过视频。
+9. 自动处理“按住通过”课堂注意力校验，并尽量保持页面前台、焦点与可见性状态。
 */
 
 (function () {
@@ -131,6 +132,10 @@
   ];
   const RETRY_DELAYS = [500, 1500, 4000, 8000];
   const AUTOPLAY_RETRY_DELAYS = [300, 1000, 2500, 5000, 9000];
+  const POST_NAV_PLAY_BASE = 5000;
+  const POST_NAV_PLAY_JITTER = 1200;
+  const POST_NAV_PAUSE_BASE = 5000;
+  const POST_NAV_PAUSE_JITTER = 1200;
   const wiredMedia = new WeakSet();
   const wiredPlayers = new WeakSet();
   let runtimeEnabled = false;
@@ -138,6 +143,9 @@
   let retryTimers = [];
   let autoplayTimers = [];
   let autoPlayForThisLoad = false;
+  let postNavSequencePending = false;
+  let postNavSequenceRunning = false;
+  let postNavSequenceTimers = [];
 
   for (const key of LEGACY_KEYS_TO_CLEAR) {
     try {
@@ -200,6 +208,59 @@
   function clearAutoplayRetries() {
     for (const timer of autoplayTimers) clearTimeout(timer);
     autoplayTimers = [];
+  }
+
+  function randomDelay(base, jitter) {
+    const delta = (Math.random() * 2 - 1) * jitter;
+    return Math.max(0, Math.round(base + delta));
+  }
+
+  function clearPostNavSequenceTimers() {
+    for (const timer of postNavSequenceTimers) clearTimeout(timer);
+    postNavSequenceTimers = [];
+  }
+
+  function setPostNavSequencePending(value) {
+    clearPostNavSequenceTimers();
+    postNavSequencePending = value;
+    postNavSequenceRunning = false;
+  }
+
+  function resetPostNavSequence() {
+    clearPostNavSequenceTimers();
+    postNavSequencePending = false;
+    postNavSequenceRunning = false;
+  }
+
+  function startPostNavSequence(media) {
+    postNavSequencePending = false;
+    postNavSequenceRunning = true;
+
+    const playDelay = randomDelay(POST_NAV_PLAY_BASE, POST_NAV_PLAY_JITTER);
+    const pauseDelay = randomDelay(POST_NAV_PAUSE_BASE, POST_NAV_PAUSE_JITTER);
+
+    postNavSequenceTimers.push(setTimeout(() => {
+      if (!isEnabled()) return;
+      media.pause();
+
+      postNavSequenceTimers.push(setTimeout(() => {
+        if (!isEnabled()) return;
+        try {
+          media.currentTime = 0;
+        } catch (_) {}
+        const result = media.play();
+        if (result && typeof result.catch === 'function') result.catch(() => {});
+        postNavSequenceRunning = false;
+      }, pauseDelay));
+    }, playDelay));
+  }
+
+  function maybeStartPostNavSequence(media) {
+    if (!postNavSequencePending || postNavSequenceRunning || !isEnabled()) return;
+
+    const target = media || document.querySelector('video,audio');
+    if (!target || target.ended || target.paused) return;
+    startPostNavSequence(target);
   }
 
   function createPanel() {
@@ -268,6 +329,7 @@
       } else {
         clearRetries();
         clearAutoplayRetries();
+        resetPostNavSequence();
         setAutoplayAfterNavigation(false);
         setRefreshAfterNavigation(false);
         broadcastEnabledToFrames(false, false);
@@ -340,6 +402,7 @@
 
       if (!media.paused && !media.ended) {
         setStatus('播放中');
+        maybeStartPostNavSequence(media);
         return true;
       }
 
@@ -347,13 +410,19 @@
         const result = media.play();
         if (result && typeof result.catch === 'function') {
           result
-            .then(() => setStatus('播放中'))
+            .then(() => {
+              setStatus('播放中');
+              maybeStartPostNavSequence(media);
+            })
             .catch(() => {
               if (!clickPlayerPlayButton()) setStatus('请手动播放');
             });
         } else {
           setTimeout(() => {
-            if (!media.paused && !media.ended) setStatus('播放中');
+            if (!media.paused && !media.ended) {
+              setStatus('播放中');
+              maybeStartPostNavSequence(media);
+            }
           }, 500);
         }
         return true;
@@ -383,6 +452,7 @@
     if (wiredMedia.has(media)) return false;
     wiredMedia.add(media);
     media.addEventListener('ended', onEnded);
+    media.addEventListener('playing', () => maybeStartPostNavSequence(media));
     return true;
   }
 
@@ -567,11 +637,13 @@
     if (data.type === 'set-enabled' && !isTopWindow) {
       setEnabled(Boolean(data.enabled));
       if (isEnabled()) {
+        setPostNavSequencePending(Boolean(data.autoplay));
         armEndWatcher();
         if (data.autoplay) scheduleAutoplayAfterSwitch();
       } else {
         clearRetries();
         clearAutoplayRetries();
+        resetPostNavSequence();
       }
     }
   }
@@ -590,6 +662,7 @@
         }
 
         autoPlayForThisLoad = shouldAutoplayAfterNavigation();
+        setPostNavSequencePending(autoPlayForThisLoad);
         setAutoplayAfterNavigation(false);
         if (refreshState === '2') setRefreshAfterNavigation(false);
         armEndWatcher();
