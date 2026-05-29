@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         蕴瑜课堂手动启动循环播放下一集
 // @namespace    http://tampermonkey.net/
-// @version      1.4
+// @version      1.5
 // @icon         https://courses.gdut.edu.cn/pluginfile.php/1/theme_lambda2/favicon/1776322049/favicon.ico
-// @description  手动启动后等待当前视频结束，自动切下一集，并在切集后自动播放
+// @description  手动启动后等待当前视频结束，自动切下一集，并在切集后自动播放；自动处理“按住通过”并保持前台状态
+// @match        https://courses.gdut.edu.cn/*
 // @match        https://courses.gdut.edu.cn/mod/fsresource/view.php*
 // @match        https://jyresource.gdut.edu.cn/*
 // @run-at       document-idle
@@ -17,17 +18,112 @@
 3. 当前视频自然结束后，优先从 Moodle/蕴瑜课堂左侧课程索引寻找下一集并自动跳转。
 4. 脚本自动切到下一集后，才会对新页面做一次有限重试的自动播放。
 5. 下一集开始播放后继续待机，等待下一次自然结束，然后重复“切集 -> 自动播放 -> 待机”。
-6. 不使用 setInterval 常驻扫描；播放器暂未出现时，只做几次短延迟重试。
+6. 播放器监听不使用 setInterval 常驻扫描（按住通过检测除外）；播放器暂未出现时，只做几次短延迟重试。
 7. 不倍速、不伪造观看进度、不跳过视频。
-8. 不处理或绕过“按住通过”等课堂注意力校验，也不伪造页面前台、焦点或可见性状态。
+8. 自动处理“按住通过”课堂注意力校验，并尽量保持页面前台、焦点与可见性状态。
 */
 
 (function () {
   'use strict';
 
+  const isCourseHost = location.hostname === 'courses.gdut.edu.cn';
+  const isCourseVideoPage = isCourseHost && location.pathname === '/mod/fsresource/view.php';
+  const isResourcePlayerPage = location.hostname === 'jyresource.gdut.edu.cn';
+  const shouldRunAutoNext = isCourseVideoPage || isResourcePlayerPage;
+  const isTopWindow = window.top === window.self;
+
+  const HOLD_CHECK_INTERVAL = 5000;
+  const HOLD_DURATION = 6000;
+  const HOLD_PROCESSING_ATTR = 'data-yy-hold-processing';
+  const HOLD_LOG_THROTTLE = 60000;
+
+  function initKeepActive() {
+    try {
+      Object.defineProperty(document, 'hidden', { get: () => false, configurable: true });
+      Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true });
+      Object.defineProperty(document, 'webkitVisibilityState', { get: () => 'visible', configurable: true });
+
+      window.addEventListener('visibilitychange', event => event.stopImmediatePropagation(), true);
+      window.addEventListener('webkitvisibilitychange', event => event.stopImmediatePropagation(), true);
+      window.addEventListener('blur', event => event.stopImmediatePropagation(), true);
+
+      Object.defineProperty(document, 'hasFocus', { value: () => true, configurable: true });
+    } catch (error) {
+      console.error('[-] 无法保持前台，尽量不要把蕴瑜课堂切换到后台吧', error);
+    }
+  }
+
+  function initHoldSolver() {
+    let lastMissLogAt = 0;
+
+    function dispatchHoldEvent(button, pointerType) {
+      if (typeof PointerEvent === 'function') {
+        button.dispatchEvent(new PointerEvent(pointerType, {
+          bubbles: true,
+          cancelable: true,
+          view: window
+        }));
+      }
+
+      const mouseType = pointerType === 'pointerdown' ? 'mousedown' : 'mouseup';
+      button.dispatchEvent(new MouseEvent(mouseType, {
+        bubbles: true,
+        cancelable: true,
+        view: window
+      }));
+    }
+
+    function solveHold() {
+      const button = Array.from(document.querySelectorAll('button'))
+        .find(item => (item.textContent || '').includes('按住通过'));
+
+      if (!button) {
+        const now = Date.now();
+        if (now - lastMissLogAt > HOLD_LOG_THROTTLE) {
+          console.log('[-] 当前页面没找到「按住通过」的按钮哦');
+          lastMissLogAt = now;
+        }
+        return;
+      }
+
+      if (button.getAttribute(HOLD_PROCESSING_ATTR)) return;
+
+      console.log('[+] 找到弹窗啦！');
+      button.setAttribute(HOLD_PROCESSING_ATTR, 'true');
+
+      dispatchHoldEvent(button, 'pointerdown');
+      console.log('[*] 已按下按钮，等条满');
+
+      setTimeout(() => {
+        dispatchHoldEvent(button, 'pointerup');
+
+        setTimeout(() => {
+          button.removeAttribute(HOLD_PROCESSING_ATTR);
+        }, 1000);
+
+        console.log('[+] 验证完毕，老师我在听课哦 ^v^');
+      }, HOLD_DURATION);
+    }
+
+    if (typeof window.solveHold !== 'function') {
+      window.solveHold = solveHold;
+    }
+
+    solveHold();
+    setInterval(solveHold, HOLD_CHECK_INTERVAL);
+  }
+
+  if (isCourseHost) {
+    initKeepActive();
+    initHoldSolver();
+  }
+
+  if (!shouldRunAutoNext) return;
+
   const SOURCE = 'yy-next-watcher';
   const STORAGE_KEY = 'yy_next_watcher_enabled_v1';
   const AUTOPLAY_AFTER_NAV_KEY = 'yy_next_watcher_autoplay_after_nav_v1';
+  const REFRESH_AFTER_NAV_KEY = 'yy_next_watcher_refresh_after_nav_v1';
   const LEGACY_KEYS_TO_CLEAR = [
     'yy_auto_play_next_enabled',
     'yy_auto_single_playback_lock_v1',
@@ -35,10 +131,6 @@
   ];
   const RETRY_DELAYS = [500, 1500, 4000, 8000];
   const AUTOPLAY_RETRY_DELAYS = [300, 1000, 2500, 5000, 9000];
-  const isCourseVideoPage = location.hostname === 'courses.gdut.edu.cn' && location.pathname === '/mod/fsresource/view.php';
-  const isResourcePlayerPage = location.hostname === 'jyresource.gdut.edu.cn';
-  const shouldRun = isCourseVideoPage || isResourcePlayerPage;
-  const isTopWindow = window.top === window.self;
   const wiredMedia = new WeakSet();
   const wiredPlayers = new WeakSet();
   let runtimeEnabled = false;
@@ -52,8 +144,6 @@
       localStorage.removeItem(key);
     } catch (_) {}
   }
-
-  if (!shouldRun) return;
 
   function storedEnabled() {
     return localStorage.getItem(STORAGE_KEY) === '1';
@@ -80,6 +170,20 @@
       localStorage.setItem(AUTOPLAY_AFTER_NAV_KEY, '1');
     } else {
       localStorage.removeItem(AUTOPLAY_AFTER_NAV_KEY);
+    }
+  }
+
+  function getRefreshAfterNavigation() {
+    if (!isCourseVideoPage) return null;
+    return localStorage.getItem(REFRESH_AFTER_NAV_KEY);
+  }
+
+  function setRefreshAfterNavigation(value) {
+    if (!isCourseVideoPage) return;
+    if (!value) {
+      localStorage.removeItem(REFRESH_AFTER_NAV_KEY);
+    } else {
+      localStorage.setItem(REFRESH_AFTER_NAV_KEY, String(value));
     }
   }
 
@@ -165,6 +269,7 @@
         clearRetries();
         clearAutoplayRetries();
         setAutoplayAfterNavigation(false);
+        setRefreshAfterNavigation(false);
         broadcastEnabledToFrames(false, false);
       }
     });
@@ -430,7 +535,10 @@
     }
 
     setStatus('正在进入下一集');
-    if (isEnabled()) setAutoplayAfterNavigation(true);
+    if (isEnabled()) {
+      setAutoplayAfterNavigation(true);
+      setRefreshAfterNavigation('1');
+    }
     location.href = link.href;
   }
 
@@ -474,8 +582,16 @@
 
     if (isTopWindow) {
       if (isEnabled()) {
+        const refreshState = getRefreshAfterNavigation();
+        if (refreshState === '1') {
+          setRefreshAfterNavigation('2');
+          location.reload();
+          return;
+        }
+
         autoPlayForThisLoad = shouldAutoplayAfterNavigation();
         setAutoplayAfterNavigation(false);
+        if (refreshState === '2') setRefreshAfterNavigation(false);
         armEndWatcher();
         if (autoPlayForThisLoad) scheduleAutoplayAfterSwitch();
         broadcastEnabledToFrames(true, autoPlayForThisLoad);
